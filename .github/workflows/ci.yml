@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  roserver:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: roserver
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: roserver
+      # roboagent is an editable sibling dependency (../roboagent). Point this
+      # at the real repository/ref for the integration.
+      - uses: actions/checkout@v4
+        with:
+          repository: SiYueY/roboagent
+          path: roboagent
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --frozen
+      - name: Ruff
+        run: uv run ruff check roserver tests
+      - name: Mypy
+        run: uv run mypy
+      - name: Pytest
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: uv run pytest -q
