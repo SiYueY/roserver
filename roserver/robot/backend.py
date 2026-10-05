@@ -1,13 +1,8 @@
-"""robot backend boundary and a deterministic simulated robot (docs §4.1-§4.4).
+"""Robot backend boundary and a deterministic simulated robot (docs §4.1-§4.4).
 
-项目当前**尚未进入机器人集成阶段**，因此 roserver 只定义抽象边界，并只提供
-一个离线、确定性的模拟机器人：
-
-    RobotBackend            抽象接口（今天的唯一实现见下）
-    SimulatedRobotBackend   模拟实现，测试与开发使用
-
-未来接入真实机器人时，实现该接口的将是 **ROS2** 通道（rclpy 节点或复用
-mfr3duo 既有 ROS2 栈），**不引入 gRPC**，也不新增 C++ 网关进程。
+RobotBackend defines the shared asynchronous contract. SimulatedRobotBackend
+is deterministic and offline. DclpyRobotBackend implements real ROS 2 DDS
+state/control and calls the existing mfr3duo Robot SDK through its Task Action.
 
 机器人后端失败按 §7.9 映射到封闭的 Product 错误码：
 
@@ -81,6 +76,14 @@ class RobotNotFoundError(RobotBackendError):
     code = "robot_not_found"
 
 
+class RobotRecoveryRequiredError(RobotBackendError):
+    code = "robot_recovery_required"
+
+
+class RobotExecutionError(RobotBackendError):
+    code = "robot_execution_failed"
+
+
 class ControlAuthorityRequiredError(RobotBackendError):
     code = "control_authority_required"
 
@@ -95,17 +98,15 @@ def to_product_error(exc: RobotBackendError) -> ProductError:
 
 
 # ---------------------------------------------------------------------
-# robot backend boundary (future real implementation: ROS2)
+# robot backend boundary
 # ---------------------------------------------------------------------
 @runtime_checkable
 class RobotBackend(Protocol):
     """Robot backend boundary.
 
-    今天的实现是 :class:`SimulatedRobotBackend`；未来接入真实机器人时由
-    **ROS2** 实现填充该接口（不引入 gRPC，也不新增独立网关进程）。
-
-    每个非流式调用都带显式 ``timeout_ms``；v1 不包含长期运行操作
-    （docs Phase 3A「超时」）。
+    Both the offline simulator and DCLPY backend implement this contract.
+    Non-stream calls carry explicit deadlines. Long-running physical commands
+    use RobotOperations and the backend's optional execute_operation capability.
     """
 
     async def list_robots(
@@ -235,6 +236,15 @@ class SimulatedRobotBackend:
             robot.last_update = self._clock()
         # One-shot fault injection for deadline / unavailability mapping tests.
         self._fail_next: str | None = None
+
+    is_simulated = True
+
+    async def startup(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        for robot in self._robots.values():
+            await self.stop(robot.robot_id)
 
     @staticmethod
     def _seed(robot_id: str, connection: str) -> _SimRobot:
@@ -453,6 +463,12 @@ class SimulatedRobotBackend:
         robot.velocity = {"linear_x": 0.0, "linear_y": 0.0, "angular_z": 0.0}
         robot.mode = "idle"
         return True
+
+    async def renew_control(self, robot_id: str, authority_id: str, *, ttl_s: float) -> None:
+        robot = self._require(robot_id)
+        if self._live_authority(robot, self._clock()) != authority_id:
+            raise ControlAuthorityRequiredError("Control authority is expired.")
+        robot.authority_expires_at = self._clock() + ttl_s
 
     async def send_velocity(
         self,

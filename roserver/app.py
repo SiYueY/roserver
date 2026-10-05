@@ -70,7 +70,13 @@ def create_app(
     approval_provider = ProductApprovalProvider(
         store, owner_id=resolved.owner_id, ttl=resolved.approval_ttl
     )
-    backend: RobotBackend = robot_backend or SimulatedRobotBackend()
+    if robot_backend is not None:
+        backend = robot_backend
+    elif resolved.robot_backend == "dclpy":
+        from .robot.dclpy_backend import DclpyRobotBackend
+        backend = DclpyRobotBackend(resolved)
+    else:
+        backend = SimulatedRobotBackend()
     robot = RobotService(settings=resolved, backend=backend, store=store)
     # Phase 3B: the Agent Tool path uses the same RobotService as the manual UI.
     factory = AgentFactory(
@@ -97,8 +103,17 @@ def create_app(
         workspace=workspace,
         result_materializer=WorkspaceToolResultMaterializer(workspace=workspace),
     )
-    engine: MediaEngine = media_engine or SimulatedMediaEngine()
+    if media_engine is not None:
+        engine = media_engine
+    elif callable(getattr(backend, "camera_frame", None)):
+        from .media.dclpy_engine import DclpyMediaEngine
+        engine = DclpyMediaEngine(backend)
+    else:
+        engine = SimulatedMediaEngine()
     media = MediaService(settings=resolved, engine=engine)
+    set_disconnect = getattr(engine, "set_disconnect_handler", None)
+    if set_disconnect is not None:
+        set_disconnect(media.on_client_disconnect)
     # Phase 5B: the speech bridge is likewise injectable and simulation-only.
     speech_engine_resolved: SpeechEngine = speech_engine or SimulatedSpeechEngine(
         max_audio_frames=resolved.speech_max_audio_frames,
@@ -111,7 +126,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await service.startup()
-        # The robot layer is simulation-only and must never block core features
+        # The robot layer must never block core features
         # (agent / session / run / artifact).  A robot-side failure is logged and
         # isolated instead of aborting application startup.
         robot_ready = False
@@ -145,11 +160,8 @@ def create_app(
         try:
             yield
         finally:
-            if robot_ready:
-                try:
-                    await robot.shutdown()
-                except Exception:  # pragma: no cover - defensive isolation
-                    logger.exception("robot backend failed to shut down cleanly")
+            # Settle Agent tools while their robot/media resources still exist.
+            await service.shutdown(close_store=False)
             if speech_ready:
                 try:
                     await speech.close()
@@ -160,7 +172,12 @@ def create_app(
                     await media.close()
                 except Exception:  # pragma: no cover - defensive isolation
                     logger.exception("media layer failed to shut down cleanly")
-            await service.shutdown()
+            if robot_ready or resolved.robot_backend == "dclpy":
+                try:
+                    await robot.shutdown()
+                except Exception:  # pragma: no cover - defensive isolation
+                    logger.exception("robot backend failed to shut down cleanly")
+            await store.close()
 
     app = FastAPI(title="roserver", version=__version__, lifespan=lifespan)
     app.state.settings = resolved

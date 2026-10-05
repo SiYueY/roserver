@@ -9,6 +9,7 @@ the browser (docs §4.8).
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import uuid
 from collections import deque
@@ -25,6 +26,7 @@ from .backend import (
     RobotBackend,
     to_product_error,
 )
+from .operations import RobotOperations
 
 TELEOP_MODE = "teleoperation"
 MODE_IDLE = "idle"
@@ -38,6 +40,7 @@ ROBOT_EVENT_TYPES = frozenset(
         "robot.mode_changed",
         "robot.fault",
         "control.authority_changed",
+        "robot.operation",
     }
 )
 TELEOP_EVENT_TYPES = frozenset(
@@ -57,7 +60,7 @@ _COMPARE_KEYS = (
 
 def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        return float(value) if math.isfinite(value) else None
     return None
 
 
@@ -187,6 +190,7 @@ class RobotService:
         self._last_commands: dict[str, float] = {}
         self._last_sequences: dict[str, int] = {}
         self._recent_commands: dict[str, deque[float]] = {}
+        self.operations = RobotOperations(self)
 
     # =================================================================
     # lifecycle
@@ -195,9 +199,24 @@ class RobotService:
         # One-time connectivity probe.  A real ROS2/DDS backend may need to join a
         # domain here; failures propagate so the application lifespan can isolate
         # them and keep serving core features.
+        startup = getattr(self.backend, "startup", None)
+        if startup is not None:
+            await startup()
         await self._guard(self.backend.list_robots(timeout_ms=DEFAULT_TIMEOUT_MS))
+        await self.operations.startup()
+        # Persisted browser leases are never resumed across a process restart.
+        discard = getattr(self.backend, "discard_persisted_authority", None)
+        if discard is not None:
+            rows = await asyncio.to_thread(self.store._query,
+                "SELECT robot_id,authority_id FROM robot_authorities WHERE owner_id=?", (self.owner_id,))
+            for row in rows:
+                if row["authority_id"]:
+                    await self._guard(discard(row["robot_id"], row["authority_id"]))
+        await asyncio.to_thread(self.store._execute,
+            "DELETE FROM robot_authorities WHERE owner_id=?", (self.owner_id,))
 
     async def shutdown(self) -> None:
+        await self.operations.close()
         tasks = [*self._watchers.values(), *self._watchdogs.values()]
         self._watchers.clear()
         self._watchdogs.clear()
@@ -209,6 +228,9 @@ class RobotService:
             for subscription in subscriptions:
                 subscription.close()
         self._subscribers.clear()
+        close = getattr(self.backend, "close", None)
+        if close is not None:
+            await close()
 
     def _cancel_watchdog(self, robot_id: str) -> None:
         task = self._watchdogs.pop(robot_id, None)
@@ -286,7 +308,7 @@ class RobotService:
             raise ProductError(
                 "invalid_input", "Only teleoperation control authority is supported."
             )
-        if ttl_s is not None and ttl_s <= 0:
+        if ttl_s is not None and (not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > 3600):
             raise ProductError("invalid_input", "ttl_s must be positive.")
         await self._require_online(robot_id)
         now = time.time()
@@ -394,6 +416,21 @@ class RobotService:
             },
         }
 
+    async def renew_authority(self, robot_id: str, authority_id: str) -> dict[str, Any]:
+        record = await self.store.get_robot_authority(robot_id, self.owner_id)
+        now = time.time()
+        if record is None or record.get("authority_id") != authority_id or record["expires_at"] <= now:
+            raise ProductError("control_authority_required", "Control authority is absent or expired.")
+        renew = getattr(self.backend, "renew_control", None)
+        if renew is None:
+            raise ProductError("robot_not_ready", "Backend cannot renew control authority.")
+        await self._guard(renew(robot_id, authority_id, ttl_s=self.settings.robot_authority_ttl))
+        expires = now + self.settings.robot_authority_ttl
+        await asyncio.to_thread(self.store._execute,
+            "UPDATE robot_authorities SET expires_at=? WHERE robot_id=? AND owner_id=? AND authority_id=?",
+            (expires, robot_id, self.owner_id, authority_id))
+        return {"authority_id": authority_id, "robot_id": robot_id, "mode": record["mode"], "expires_at": rfc3339(expires)}
+
     async def has_authority(self, robot_id: str) -> bool:
         record = await self.store.get_robot_authority(robot_id, self.owner_id)
         if record is None:
@@ -443,9 +480,8 @@ class RobotService:
         if linear_x is None or linear_y is None or angular_z is None:
             return self._reject(robot_id, "invalid_input")
         if (
-            abs(linear_x) > self.settings.robot_max_linear_velocity
-            or abs(linear_y) > self.settings.robot_max_linear_velocity
-            or abs(angular_z) > self.settings.robot_max_angular_velocity
+            math.hypot(linear_x, linear_y) > min(self.settings.robot_max_linear_velocity, .3 if not getattr(self.backend, "is_simulated", True) else self.settings.robot_max_linear_velocity)
+            or abs(angular_z) > min(self.settings.robot_max_angular_velocity, .5 if not getattr(self.backend, "is_simulated", True) else self.settings.robot_max_angular_velocity)
         ):
             return self._reject(robot_id, "velocity_limit")
 

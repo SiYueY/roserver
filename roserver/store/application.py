@@ -120,6 +120,18 @@ CREATE TABLE IF NOT EXISTS robot_authorities (
     expires_at   REAL
 );
 
+CREATE TABLE IF NOT EXISTS robot_operations (
+    operation_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    robot_id TEXT NOT NULL,
+    idempotency_key TEXT,
+    arguments_digest TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(owner_id, robot_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS artifact_references (
     artifact_id TEXT NOT NULL,
     owner_id    TEXT NOT NULL,

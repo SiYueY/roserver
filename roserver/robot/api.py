@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from ..errors import ProductError
@@ -20,6 +21,7 @@ from .service import (
     RobotService,
     RobotSubscription,
 )
+from .images import image_jpeg
 
 router = APIRouter(prefix="/api/v1")
 
@@ -71,6 +73,61 @@ async def get_robot_state(robot_id: str, request: Request) -> dict[str, Any]:
     return await get_robot_service(request).get_robot_state(robot_id)
 
 
+@router.get("/robots/{robot_id}/cameras/{camera_id}/image")
+async def camera_image(robot_id: str, camera_id: str, request: Request) -> Response:
+    service = get_robot_service(request)
+    await service.get_robot(robot_id)
+    camera = getattr(service.backend, "camera_snapshot", None) or getattr(service.backend, "camera_frame", None)
+    if camera is None:
+        raise ProductError("robot_not_ready", "No real camera is available.")
+    message = await service._guard(_camera_frame(camera, f"robot_{camera_id}"))
+    try:
+        data = await asyncio.to_thread(image_jpeg, message)
+    except ValueError as exc:
+        raise ProductError("unsupported_media_type", str(exc)) from exc
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/robots/{robot_id}/observations")
+async def observations(robot_id: str, request: Request) -> dict[str, Any]:
+    service = get_robot_service(request)
+    read = getattr(service.backend, "get_observations", None)
+    if read is None:
+        raise ProductError("robot_not_ready", "Robot observations are unavailable.")
+    return await service._guard(read(robot_id))
+
+
+async def _camera_frame(camera: Any, source: str) -> Any:
+    import inspect
+    frame = camera(source)
+    return await frame if inspect.isawaitable(frame) else frame
+
+
+@router.post("/robots/{robot_id}/operations", status_code=202)
+async def start_operation(robot_id: str, request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    return await get_robot_service(request).operations.start(robot_id, body, request.headers.get("Idempotency-Key"))
+
+
+@router.get("/robots/{robot_id}/operations/{operation_id}")
+async def get_operation(robot_id: str, operation_id: str, request: Request) -> dict[str, Any]:
+    return get_robot_service(request).operations.get(robot_id, operation_id)
+
+
+@router.post("/robots/{robot_id}/operations/{operation_id}/cancel")
+async def cancel_operation(robot_id: str, operation_id: str, request: Request) -> dict[str, Any]:
+    return await get_robot_service(request).operations.cancel(robot_id, operation_id)
+
+
+@router.post("/robots/{robot_id}/stop")
+async def stop_robot(robot_id: str, request: Request) -> dict[str, Any]:
+    service = get_robot_service(request)
+    for identifier, task in tuple(service.operations._tasks.items()):
+        if not task.done() and service.operations.get(robot_id, identifier)["robot_id"] == robot_id:
+            await service.operations.cancel(robot_id, identifier)
+    stopped = await service._guard(service.backend.stop(robot_id))
+    return {"robot_id": robot_id, "stopped": stopped}
+
+
 # =====================================================================
 # control authority (docs §4.6)
 # =====================================================================
@@ -104,6 +161,13 @@ async def release_control(
 @router.get("/robots/{robot_id}/control")
 async def get_control(robot_id: str, request: Request) -> dict[str, Any]:
     return await get_robot_service(request).get_authority(robot_id)
+
+
+@router.post("/robots/{robot_id}/control/renew")
+async def renew_control(robot_id: str, request: Request, body: ReleaseControlRequest) -> dict[str, Any]:
+    if not body.authority_id:
+        raise ProductError("control_authority_required", "authority_id is required.")
+    return await get_robot_service(request).renew_authority(robot_id, body.authority_id)
 
 
 # =====================================================================

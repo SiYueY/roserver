@@ -262,7 +262,7 @@ Robot state subscription
 rodesk ──network──► roserver ──python dependency──► roboagent
                        │
                        └────► robot backend
-                              （当前只有模拟实现）
+                              （simulated / dclpy，可配置）
 ```
 
 机器人通信方向：
@@ -294,12 +294,12 @@ roboagent import RobotService
 > 机器人通信统一使用 **ROS2**。
 > **不引入 gRPC**，不新增 proto，不新增独立 C++ 网关进程。
 
-项目当前**尚未进入机器人集成阶段**，因此：
+当前已进入 dclpy 机器人集成阶段：
 
 ```text id="pm-robot-stage"
-现在   roserver 只定义机器人边界，并只提供模拟机器人（SimulatedRobotBackend）
-       Product API / 控制权 / 遥操作语义全部真实实现，但驱动的是模拟状态
-将来   用 ROS2 实现填充同一个边界，Product API 与前端契约不变
+默认   SimulatedRobotBackend 用于离线开发
+实接   ROSERVER_ROBOT_BACKEND=dclpy 使用真实 ROS2 状态、控制、任务和相机
+       保留 Product 契约，补充异步 operations、租约续期和 JPEG 快照接口
 ```
 
 边界形态：
@@ -310,9 +310,7 @@ Python（≥3.12）
     │
     │ RobotBackend 抽象接口
     ▼
-SimulatedRobotBackend      ← 今天只有这个实现
-    ┆
-    ┆ （将来替换为 ROS2 实现）
+SimulatedRobotBackend / DclpyRobotBackend
     ▼
 ROS2 ──► ros2_control / MoveIt / Nav2 / SDK
 ```
@@ -320,17 +318,16 @@ ROS2 ──► ros2_control / MoveIt / Nav2 / SDK
 关于进程形态：
 
 ```text id="pm-robot-process"
-v1 不冻结 roserver 是否内嵌 rclpy。
-在机器人集成阶段再决定：
-    a) roserver 进程内使用 rclpy
-    b) 独立 ROS2 节点/桥接进程，两侧仍以 ROS2 接口通信
-无论选哪种，对 roserver 上层暴露的都是 RobotBackend 接口。
+roserver 进程内使用 CPython 3.12 dclpy，AsyncIOExecutor 由 ASGI owner loop 驱动。
+不加载 Humble 的 CPython 3.10 rclpy；使用 ROSIDL 生成的 *_dclpy 绑定。
+整机任务由已有 task_demo 的 serve_tasks 模式托管 Robot SDK，不新增网关可执行程序。
+对 roserver 上层暴露 RobotBackend 和 RobotService。
 ```
 
 不引入 gRPC 的原因：
 
 1. 机器人侧本来就是 ROS2 原生栈，再包一层 gRPC 只增加一层协议与一份 proto 维护成本；
-2. 项目尚未进入机器人集成阶段，提前冻结跨语言进程边界没有必要；
+2. dclpy 可直接进入现有 DDS 域，无需额外跨语言 RPC 协议；
 3. ROS2 已是既有的、可复用的通信与生命周期基础设施。
 
 当前阶段模拟实现必须只暴露真实具备的能力：
@@ -3115,16 +3112,15 @@ web/src/modules/agent/services/index.ts
 
 **不新增机器人侧进程，不引入 gRPC。**
 
-项目当前未进入机器人集成阶段，因此 roserver 只冻结一个内部抽象边界，并只提供
-模拟实现：
+机器人边界现有两种可配置实现：
 
 ```text id="6ptl3a"
 RobotBackend
-    ├── SimulatedRobotBackend   今天只有这个
-    └── （将来）ROS2 实现
+    ├── SimulatedRobotBackend   离线开发与测试
+    └── DclpyRobotBackend       ROS2 真实状态、控制、任务与相机
 ```
 
-职责（今日由模拟器承担，将来由 ROS2 实现承担）：
+共同职责（真实模式复用 ROS2 / Robot SDK 的物理约束）：
 
 ```text id="ahbua3"
 robot discovery
@@ -3143,7 +3139,7 @@ robot-side safety
 不新增 C++ 进程
 ```
 
-将来接入真实机器人时，使用 **dcl**（DDS Client Library）进入 ROS2 生态：
+真实机器人使用 **dcl**（DDS Client Library）进入 ROS2 生态：
 
 ```text id="pm-future-ros2"
 仓库      https://github.com/SiYueY/dcl
@@ -3158,23 +3154,25 @@ robot-side safety
 1  用 dclpy 实现 RobotBackend
        Topic / Service / Action / Graph 覆盖 state 与 teleoperation
 2  复用 mfr3duo_ros2 既有包（mfr3duo_control / moveit / hardware）
-3  mfr3duo_nav 完成 Gate 后才接入导航能力
-4  Product API 与前端契约不发生任何变化
+3  整机通过 ExecuteTask Action 复用已实现的导航、抓取、放置与恢复语义
+4  保留 Product API 与前端契约，扩展 operations / renew / JPEG 接口
 5  不引入 gRPC，不新增 C++ 网关进程
 ```
 
-当前状态（据此保持模拟实现）：
+当前状态：
 
 ```text id="pm-dcl-status"
-dclpy 目前只有架构文档（dcl/dclpy/docs/dclpy.md，Architecture Frozen Candidate），
-尚无实现代码。因此在 dclpy 可用之前，roserver 一律使用 SimulatedRobotBackend。
+dclpy 已有运行实现；通过 ROSERVER_ROBOT_BACKEND=dclpy 显式启用。
+原生组件与生成绑定的安装、部署、验收命令见 README.md。
+物理操作先持久化再派发，重启只查询/取消原 UUID；终止不确定时禁止继续动作。
+默认 simulated 只用于离线环境，真实模式失败不得伪装为模拟成功。
 ```
 
 机器人后端失败到 Product 错误码的映射见 §7.9。
 
 #### 与基础功能开发的隔离约束
 
-机器人层当前是**模拟实现**，且不得影响 agent / session / run / artifact 等基础功能：
+机器人层（两种实现）均不得影响 agent / session / run / artifact 等基础功能：
 
 ```text id="pm-robot-isolation"
 1  核心模块（agent / artifact / store）不得 import robot
@@ -3600,6 +3598,12 @@ command_rejected
 robot_fault
 ```
 
+`RobotService` 的停止事件沿用 `control_lost`，原因位于 Product 事件的
+`data.reason`。其中 `deadman`、`watchdog` 表示速度归零，控制租约仍然有效；
+rodesk 将这两种情况映射为本地 `motion_stopped` 事件，松手后允许重新操作。
+watchdog 停止时必须等待摇杆释放，禁止自动恢复仍被按住的输入。
+其他 `control_lost` 原因以及 `authority_expired` 按真正的控制权丢失处理。
+
 ### 4.10 rodesk Teleoperation
 
 现有：
@@ -3700,6 +3704,7 @@ interface TeleopFeedback {
 }
 
 type TeleopEvent =
+  | { type: 'motion_stopped'; reason: 'deadman' | 'watchdog' }
   | { type: 'control_lost' }
   | { type: 'authority_expired' }
   | { type: 'command_rejected'; reason: string }

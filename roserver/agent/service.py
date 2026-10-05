@@ -286,7 +286,7 @@ class AgentService:
         await self.store.purge_expired_idempotency(time.time())
         await self._reconcile()
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, close_store: bool = True) -> None:
         if self.approval_provider is not None:
             await self.approval_provider.shutdown()
         actives = list(self._active.values())
@@ -317,7 +317,8 @@ class AgentService:
             except Exception:  # pragma: no cover - best effort shutdown
                 pass
         self._sessions.clear()
-        await self.store.close()
+        if close_store:
+            await self.store.close()
 
     def _lock_for(self, session_id: str) -> asyncio.Lock:
         lock = self._locks.get(session_id)

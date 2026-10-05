@@ -14,6 +14,7 @@ performs runtime "hacks" to enforce it.
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -100,6 +101,15 @@ class Settings:
     robot_rate_limit: int = 100
     robot_max_linear_velocity: float = 1.0
     robot_max_angular_velocity: float = 1.0
+    robot_backend: str = "simulated"
+    robot_id: str = "robot_1"
+    robot_namespace: str = "/"
+    robot_domain_id: int = 0
+    robot_startup_timeout: float = 20.0
+    robot_state_timeout: float = 1.0
+    robot_operation_timeout: float = 180.0
+    robot_terminal_timeout: float = 15.0
+    robot_camera_enabled: bool = True
 
     # Phase 5A media / WebRTC signaling limits (docs §5.4-§5.6).
     media_session_ttl: float = 600.0
@@ -124,6 +134,12 @@ class Settings:
     extra: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.robot_backend not in {"simulated", "dclpy"}:
+            raise ValueError("robot_backend must be simulated or dclpy.")
+        if not self.robot_id or not self.robot_namespace.startswith("/"):
+            raise ValueError("robot_id must be non-empty and robot_namespace absolute.")
+        if type(self.robot_domain_id) is not int or not 0 <= self.robot_domain_id <= 232:
+            raise ValueError("robot_domain_id must be in 0..232.")
         if not isinstance(self.host, str) or not self.host:
             raise ValueError("host must be non-empty.")
         if not 1 <= self.port <= 65535:
@@ -157,12 +173,16 @@ class Settings:
             "robot_stale_command_seconds",
             "robot_max_linear_velocity",
             "robot_max_angular_velocity",
+            "robot_startup_timeout",
+            "robot_state_timeout",
+            "robot_operation_timeout",
+            "robot_terminal_timeout",
             "media_session_ttl",
             "media_expiry_tick",
             "media_tombstone_ttl",
         ):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive.")
 
     # -- derived paths -------------------------------------------------
@@ -265,6 +285,15 @@ class Settings:
                 "ROSERVER_ROBOT_STALE_COMMAND_SECONDS", 5.0
             ),
             robot_rate_limit=get_int("ROSERVER_ROBOT_RATE_LIMIT", 100),
+            robot_backend=get("ROSERVER_ROBOT_BACKEND", "simulated") or "simulated",
+            robot_id=get("ROSERVER_ROBOT_ID", "robot_1") or "robot_1",
+            robot_namespace=get("ROSERVER_ROBOT_NAMESPACE", "/") or "/",
+            robot_domain_id=get_int("ROSERVER_ROBOT_DOMAIN_ID", get_int("ROS_DOMAIN_ID", 0)),
+            robot_startup_timeout=get_float("ROSERVER_ROBOT_STARTUP_TIMEOUT", 20.0),
+            robot_state_timeout=get_float("ROSERVER_ROBOT_STATE_TIMEOUT", 1.0),
+            robot_operation_timeout=get_float("ROSERVER_ROBOT_OPERATION_TIMEOUT", 180.0),
+            robot_terminal_timeout=get_float("ROSERVER_ROBOT_TERMINAL_TIMEOUT", 15.0),
+            robot_camera_enabled=get_bool("ROSERVER_ROBOT_CAMERA_ENABLED", True),
             robot_max_linear_velocity=get_float(
                 "ROSERVER_ROBOT_MAX_LINEAR_VELOCITY", 1.0
             ),
