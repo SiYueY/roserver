@@ -59,6 +59,30 @@ def test_agent_tool_reads_robot_state_through_service(tmp_path):
     asyncio.run(check())
 
 
+def test_agent_tool_resolves_display_name_to_only_robot(tmp_path):
+    async def check() -> None:
+        settings, store, service = _build(tmp_path)
+        await store.open()
+        tools = robot_tools(service, settings)
+        call = ToolCall(
+            "call_display_name", "get_robot_state", FrozenJsonObject({"robot_id": "MFR3Duo"})
+        )
+        agent = Agent(
+            FakeModel([Turn(text="", tool_calls=(call,)), Turn(text="reported")]),
+            tool_registry=ToolRegistry(tools),
+            prompt=PromptInput("Operate the robot."),
+        )
+        session = agent.new_session(session_id="display-name")
+        result = await session.start(UserMessage("read the robot state")).result()
+
+        assert result.status is RunStatus.COMPLETED, result.error
+        message = next(message for message in session.messages if message.role == "tool")
+        assert message.content[0].value["robot_id"] == ROBOT_ID
+        await store.close()
+
+    asyncio.run(check())
+
+
 def test_agent_tool_simulation_navigate_goes_through_robot_service(tmp_path):
     async def check() -> None:
         settings, store, service = _build(tmp_path)

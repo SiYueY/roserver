@@ -28,6 +28,7 @@ from . import __version__
 from .agent.api import router as agent_router
 from .agent.approval import ProductApprovalProvider
 from .agent.factory import AgentFactory, ModelFactory
+from .agent.policy import RequireApprovalForSideEffects
 from .agent.service import AgentService
 from .artifact.adapters import ServiceMediaResolver
 from .artifact.api import router as artifact_router
@@ -85,11 +86,19 @@ def create_app(
         model=model,
         model_factory=model_factory,
         tools=(*tools, *robot_tools(robot, resolved)),
-        tool_policy=tool_policy,
+        tool_policy=tool_policy or RequireApprovalForSideEffects(),
     )
-    agent = factory.build_agent()
     artifacts = ArtifactService(store, resolved)
     workspace = ArtifactWorkspace(artifacts)
+    agent = factory.build_agent()
+    # Robot camera frames are materialized as workspace artifacts. Bind both
+    # readers after the durable workspace exists so provider models can send
+    # them as image inputs on the following turn.
+    model_instance = agent.model
+    if hasattr(model_instance, "artifact_reader"):
+        model_instance.artifact_reader = WorkspaceArtifactReader(workspace)
+    if hasattr(model_instance, "media_resolver"):
+        model_instance.media_resolver = ServiceMediaResolver(artifacts)
     service = AgentService(
         settings=resolved,
         agent=agent,

@@ -19,6 +19,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_OWNER_ID = "local"
+DEFAULT_SYSTEM_PROMPT = """You operate an MFR3Duo robot in a simulated environment.
+Use get_robot_state and get_robot_observations before planning a physical task.
+The configured robot ID is robot_1. Omit robot_id unless a tool result explicitly
+reports a different ID; do not use the display name MFR3Duo as an ID.
+Use only the object IDs and poses returned by observations. For every navigation,
+pick, place, gripper, recovery, or scene-joint action, briefly describe the
+intent and then call the tool. The product approval flow will present the
+parameter-bound operator approval; do not ask for a separate conversational
+approval before making that tool call.
+Never claim that a physical action succeeded until execute_robot_task returns a
+verified succeeded result. If a task is cancelled, fails, or is uncertain, report
+that state and use stop_robot or recover only after approval. Continue an
+approved multi-step request until its stated goal is complete. If the requested
+placement is spatially ambiguous, ask for a precise target before picking; do
+not silently finish while an object is held. The navigation frame is map;
+never use odom or an object/world frame as a navigation target. Use the observed
+base pose and frame contract to reason about relative language. A named support
+surface (for example, a counter or shelf) must be supplied by scene observations
+or selected precisely by the operator; never invent a pose from a camera image.
+After a failed or recovery-required action, report the returned reason and do
+not retry a different physical action until fresh observations and a new plan
+justify it. Before requesting approval for a pick, call plan_robot_task with
+fresh observations. Execute only if it reports feasible and use its selected
+manipulator; otherwise explain the failure and request a revised goal."""
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -105,6 +129,10 @@ class Settings:
     robot_id: str = "robot_1"
     robot_namespace: str = "/"
     robot_domain_id: int = 0
+    # Optional PoseStamped source for the measured map/world pose of base_link.
+    # Simulation may set this to /sensors/simulation/base_pose; a real robot
+    # should set it to its localization bridge. Empty means unavailable.
+    robot_world_pose_topic: str = ""
     robot_startup_timeout: float = 20.0
     robot_state_timeout: float = 1.0
     robot_operation_timeout: float = 180.0
@@ -129,7 +157,7 @@ class Settings:
     model: str = ""
     model_config_path: Path | None = None
     model_name: str = ""
-    system_prompt: str = ""
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
     extra: dict[str, str] = field(default_factory=dict)
 
@@ -138,6 +166,10 @@ class Settings:
             raise ValueError("robot_backend must be simulated or dclpy.")
         if not self.robot_id or not self.robot_namespace.startswith("/"):
             raise ValueError("robot_id must be non-empty and robot_namespace absolute.")
+        if not isinstance(self.robot_world_pose_topic, str):
+            raise ValueError("robot_world_pose_topic must be a string.")
+        if self.robot_world_pose_topic and not self.robot_world_pose_topic.startswith("/"):
+            raise ValueError("robot_world_pose_topic must be absolute when configured.")
         if type(self.robot_domain_id) is not int or not 0 <= self.robot_domain_id <= 232:
             raise ValueError("robot_domain_id must be in 0..232.")
         if not isinstance(self.host, str) or not self.host:
@@ -289,6 +321,7 @@ class Settings:
             robot_id=get("ROSERVER_ROBOT_ID", "robot_1") or "robot_1",
             robot_namespace=get("ROSERVER_ROBOT_NAMESPACE", "/") or "/",
             robot_domain_id=get_int("ROSERVER_ROBOT_DOMAIN_ID", get_int("ROS_DOMAIN_ID", 0)),
+            robot_world_pose_topic=get("ROSERVER_ROBOT_WORLD_POSE_TOPIC", "") or "",
             robot_startup_timeout=get_float("ROSERVER_ROBOT_STARTUP_TIMEOUT", 20.0),
             robot_state_timeout=get_float("ROSERVER_ROBOT_STATE_TIMEOUT", 1.0),
             robot_operation_timeout=get_float("ROSERVER_ROBOT_OPERATION_TIMEOUT", 180.0),
@@ -320,8 +353,9 @@ class Settings:
             model=get("ROSERVER_MODEL", "") or "",
             model_config_path=Path(model_config) if model_config else None,
             model_name=get("ROSERVER_MODEL_NAME", "") or "",
-            system_prompt=get("ROSERVER_SYSTEM_PROMPT", "") or "",
+            system_prompt=get("ROSERVER_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+            or DEFAULT_SYSTEM_PROMPT,
         )
 
 
-__all__ = ["DEFAULT_OWNER_ID", "Settings"]
+__all__ = ["DEFAULT_OWNER_ID", "DEFAULT_SYSTEM_PROMPT", "Settings"]

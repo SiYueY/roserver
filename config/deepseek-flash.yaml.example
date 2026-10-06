@@ -1,0 +1,14 @@
+# Copy this file outside the repository, then set DEEPSEEK_API_KEY in the
+# environment or a sibling .env file. Do not commit real credentials.
+default_model: deepseek-flash
+models:
+  - name: deepseek-flash
+    display_name: DeepSeek Flash
+    provider: deepseek
+    params:
+      model: deepseek-flash
+      api_key: ${DEEPSEEK_API_KEY}
+      api_base: https://api.deepseek.com
+      max_tokens: 8192
+      request_timeout: 120
+      reasoning_effort: low

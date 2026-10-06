@@ -69,6 +69,25 @@ export ROSERVER_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 bash roserver/scripts/run-dclpy.sh --host 127.0.0.1 --port 8765
 ```
 
+使用 DeepSeek Flash 时，复制 `config/deepseek-flash.yaml.example` 到仓库外的
+私有路径，并在该文件同级 `.env` 或启动环境中设置 `DEEPSEEK_API_KEY`。不要保留
+`ROSERVER_MODEL=echo`，否则离线 EchoModel 会优先于模型配置。真实机器人任务默认
+在执行前产生审批请求；在 rodesk 中批准后才会发送到 ROS。DeepSeek 的推理内容会在
+工具回合之间保留，但不会投影到产品消息；相机工具产物会作为图像发送给支持视觉的
+DeepSeek Flash。
+
+```bash
+mkdir -p "$HOME/.config/roserver"
+cp config/deepseek-flash.yaml.example "$HOME/.config/roserver/deepseek-flash.yaml"
+# Use an editor to create $HOME/.config/roserver/.env with:
+# DEEPSEEK_API_KEY=your-real-key
+chmod 600 "$HOME/.config/roserver/.env"
+
+unset ROSERVER_MODEL
+export ROSERVER_MODEL_CONFIG="$HOME/.config/roserver/deepseek-flash.yaml"
+export ROSERVER_MODEL_NAME=deepseek-flash
+```
+
 rodesk/web 使用以下环境启动，Agent、状态、遥操作和视频统一指向后端：
 
 ```bash

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from conftest import (
@@ -11,6 +12,8 @@ from conftest import (
     fake_tool_call,
     make_fake_tool,
 )
+from roboagent.tool import AllowAllToolPolicy
+from roserver.app import create_app
 
 
 def test_tool_execution_and_effect_projection(client_factory, settings_factory, api):
@@ -21,7 +24,10 @@ def test_tool_execution_and_effect_projection(client_factory, settings_factory, 
         ]
     )
     with client_factory(
-        settings_factory(), model=model, tools=[make_fake_tool()]
+        settings_factory(),
+        model=model,
+        tools=[make_fake_tool()],
+        tool_policy=AllowAllToolPolicy(),
     ) as client:
         session = api.create_session(client)
         run = api.start_run(client, session["session_id"], "use tool").json()
@@ -65,6 +71,16 @@ def test_tool_execution_and_effect_projection(client_factory, settings_factory, 
         assert tool_message["tool_call_id"] == "call_1"
         assert tool_message["status"] == "success"
         assert tool_message["error"] is None
+
+
+def test_default_policy_requires_approval_for_side_effects(settings_factory):
+    app = create_app(
+        settings_factory(), model=FakeModel([Turn(text="unused")]), tools=[make_fake_tool()]
+    )
+    agent = app.state.service.agent
+    tool = agent.tool_registry.get("fake_tool")
+    decision = asyncio.run(agent.tool_policy.evaluate(fake_tool_call(), tool, None))
+    assert decision.action.value == "require_approval"
 
 
 def test_assistant_aborted_on_run_failure(client_factory, settings_factory, api):

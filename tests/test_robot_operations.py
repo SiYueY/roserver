@@ -38,6 +38,22 @@ class OperationBackend(SimulatedRobotBackend):
         self.reconciled.append(identifier)
 
 
+def test_gripper_operation_uses_safe_defaults_when_agent_omits_them():
+    move = validate_operation({"kind": "gripper_move", "width": .04}, 30.)
+    assert move["speed"] == .05
+
+    grasp = validate_operation({"kind": "gripper_grasp", "width": .04}, 30.)
+    assert grasp["speed"] == .05
+    assert grasp["force"] == 20.
+
+
+def test_spin_operation_requires_one_bounded_finite_angle():
+    assert validate_operation({"kind": "spin", "angle_rad": 2 * 3.141592653589793}, 30.)["angle_rad"] > 6
+    for value in (0., float("nan"), 2 * 3.141592653589793 + .01):
+        with pytest.raises(ProductError):
+            validate_operation({"kind": "spin", "angle_rad": value}, 30.)
+
+
 def test_operations_idempotency_conflict_and_concurrent_admission(tmp_path):
     async def run():
         settings = Settings(data_dir=tmp_path)
@@ -138,6 +154,35 @@ def test_operation_rejects_invalid_pose_before_dispatch(value):
         validate_operation({"kind": "navigate", "pose": {"x": value, "y": 1}}, 180)
 
 
+def test_navigation_requires_global_map_frame():
+    assert validate_operation({"kind": "navigate", "pose": {"frame_id": "map", "x": 1, "y": 2}}, 180)
+    for frame in ("odom", "simulation_world", "base_link"):
+        with pytest.raises(ProductError, match="map frame"):
+            validate_operation({"kind": "navigate", "pose": {"frame_id": frame, "x": 1, "y": 2}}, 180)
+
+
+def test_observations_publish_configured_measured_base_frame_without_scene_name():
+    backend = DclpyRobotBackend(Settings(robot_world_pose_topic="/localization/robot_pose"))
+    backend.context = object()
+    backend._on_base_pose(SimpleNamespace(
+        header=SimpleNamespace(frame_id="warehouse_world"),
+        pose=SimpleNamespace(position=SimpleNamespace(x=1., y=2., z=.1),
+                             orientation=SimpleNamespace(x=0., y=0., z=0., w=1.)),
+    ))
+    observed = asyncio.run(backend.get_observations("robot_1"))
+    assert observed["frames"] == {
+        "navigation": "map", "base": "warehouse_world", "object_pose_frames": []}
+    assert observed["base_pose"]["frame_id"] == "warehouse_world"
+    assert observed["base_pose"]["x"] == 1.
+
+
+def test_world_pose_topic_is_an_explicit_absolute_deployment_setting():
+    assert Settings(robot_world_pose_topic="").robot_world_pose_topic == ""
+    assert Settings(robot_world_pose_topic="/localization/robot_pose").robot_world_pose_topic
+    with pytest.raises(ValueError, match="absolute"):
+        Settings(robot_world_pose_topic="localization/robot_pose")
+
+
 @pytest.mark.parametrize("value", [{"kind": {}}, {"kind": "recover", "manipulator": []},
                                   {"kind": "sequence", "steps": [{"kind": []}]}])
 def test_invalid_operation_discriminators_return_product_error(value):
@@ -224,7 +269,14 @@ def test_real_robot_registry_never_exposes_simulation_navigation(tmp_path):
     backend = OperationBackend()
     service = RobotService(settings=settings, store=ApplicationStore(settings.resolved_db_path), backend=backend)
     names = {tool.definition.name for tool in robot_tools(service, settings)}
-    assert names == {"get_robot_state", "get_robot_observations", "execute_robot_task", "get_camera_image", "stop_robot"}
+    assert names == {
+        "get_robot_state",
+        "get_robot_observations",
+        "plan_robot_task",
+        "execute_robot_task",
+        "get_camera_image",
+        "stop_robot",
+    }
 
 
 def test_camera_tool_materializes_an_actual_jpeg_artifact(client_factory, settings_factory, api):

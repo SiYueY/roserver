@@ -14,7 +14,7 @@ from ..errors import ProductError
 from ..agent.schema import rfc3339
 from .backend import RobotBackendError
 
-KINDS = {"navigate", "pick", "place", "scene_joint", "sequence", "gripper_move", "gripper_grasp", "recover"}
+KINDS = {"navigate", "spin", "pick", "place", "scene_joint", "sequence", "gripper_move", "gripper_grasp", "recover"}
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
 
@@ -47,6 +47,11 @@ def validate_operation(value: dict[str, Any], default_timeout: float) -> dict[st
             raise ProductError("invalid_input", "A finite scene joint position is required.")
     if kind in {"navigate", "place"} and result.get("pose") is None:
         raise ProductError("invalid_input", "A target pose is required.")
+    if kind == "spin":
+        angle = result.get("angle_rad")
+        if (not isinstance(angle, (int, float)) or isinstance(angle, bool) or
+                not math.isfinite(angle) or not .01 <= abs(angle) <= math.tau):
+            raise ProductError("invalid_input", "spin angle_rad must be finite and in 0.01..2*pi radians.")
     if result.get("pose") is not None:
         pose = result["pose"]
         if not isinstance(pose, dict):
@@ -55,10 +60,21 @@ def validate_operation(value: dict[str, Any], default_timeout: float) -> dict[st
             coordinate = pose.get(name, 0.0 if name in {"z", "theta"} else None)
             if not isinstance(coordinate, (int, float)) or isinstance(coordinate, bool) or not math.isfinite(coordinate):
                 raise ProductError("invalid_input", "Pose coordinates must be finite numbers.")
-        frame = pose.get("frame_id", "map" if kind == "navigate" else "simulation_world")
+        # map is the portable global frame for navigation and manipulation.
+        # Scene-specific frames remain valid only when supplied explicitly and
+        # transformable by the robot's TF tree.
+        frame = pose.get("frame_id", "map")
         if not isinstance(frame, str) or not frame or len(frame) > 128:
             raise ProductError("invalid_input", "A valid pose frame_id is required.")
+        if kind == "navigate" and frame != "map":
+            raise ProductError("invalid_input", "Navigation poses must use the map frame.")
     if kind.startswith("gripper_"):
+        # Tool callers may deliberately omit speed to use the product's safe
+        # default. Normalize it before validation and before the DCLPy Action
+        # adapter reads the goal fields.
+        result.setdefault("speed", .05)
+        if kind == "gripper_grasp":
+            result.setdefault("force", 20.)
         for name, lower, upper in (("width", 0, .08), ("speed", .0001, .2), ("force", .001, 100)):
             if name == "force" and kind != "gripper_grasp":
                 continue

@@ -16,6 +16,8 @@ from roboagent.tool import (
     Tool,
     ToolDefinition,
     ToolEffectKind,
+    ToolErrorInfo,
+    ToolExecutionFailure,
     ToolExecutionMode,
     ToolJsonContent,
 )
@@ -40,7 +42,8 @@ def _now() -> str:
 def _definitions() -> tuple[ToolDefinition, ToolDefinition]:
     state = ToolDefinition(
         "get_robot_state",
-        "Read the current robot state (connection, mode, pose, velocity, battery).",
+        "Read the current robot state (connection, mode, pose, velocity, battery). "
+        "Use robot_id=robot_1 or omit it in this single-robot deployment.",
         FrozenJsonObject(
             {
                 "type": "object",
@@ -72,14 +75,23 @@ def _definitions() -> tuple[ToolDefinition, ToolDefinition]:
 
 async def _resolve_robot(service: RobotService, arguments: FrozenJsonObject) -> str:
     explicit = arguments.get("robot_id")
-    if isinstance(explicit, str) and explicit:
-        return explicit
     listing = await service.list_robots()
     items = listing.get("items") or []
     if not items:
         from ..errors import ProductError
 
         raise ProductError("robot_not_found", "No robot is available.")
+    if isinstance(explicit, str) and explicit:
+        if any(item.get("robot_id") == explicit for item in items):
+            return explicit
+        # Provider models commonly infer the display name (for example,
+        # ``MFR3Duo``) instead of the product ID. A single-robot deployment
+        # has no ambiguity, so resolve it to the only discovered robot.
+        if len(items) == 1:
+            return str(items[0]["robot_id"])
+        from ..errors import ProductError
+
+        raise ProductError("robot_not_found", f"Robot {explicit!r} is unavailable.")
     return str(items[0]["robot_id"])
 
 
@@ -201,23 +213,29 @@ def _real_tools(service: RobotService, state_definition: ToolDefinition, state_h
         "pose": pose, "timeout_s": {"type": "number", "minimum": .001, "maximum": 3600},
         "width": {"type": "number"}, "speed": {"type": "number"}, "force": {"type": "number"},
         "epsilon_inner": {"type": "number"}, "epsilon_outer": {"type": "number"},
-        "position": {"type": "number"},
+        "position": {"type": "number"}, "angle_rad": {"type": "number"},
     }
     step_schema = {"type": "object", "properties": {k: v for k, v in properties.items() if k != "robot_id"},
                    "required": ["kind"], "additionalProperties": False}
     properties["steps"] = {"type": "array", "items": step_schema, "minItems": 1, "maxItems": 32}
 
     async def execute(arguments: FrozenJsonObject, context: Any):
-        robot_id = await _resolve_robot(service, arguments)
-        from .operations import validate_operation
-        # Frozen JSON mappings/tuples become plain Product JSON before validation.
-        from roboagent.message import thaw_json
-        payload = thaw_json(arguments)
-        payload.pop("robot_id", None)
-        payload = validate_operation(payload, service.settings.robot_operation_timeout)
-        operation = await service.operations.start(robot_id, payload)
-        record = await service.operations.wait(robot_id, operation["operation_id"], getattr(context, "cancellation", None))
-        return ToolJsonContent(record)
+        from ..errors import ProductError
+        try:
+            robot_id = await _resolve_robot(service, arguments)
+            from .operations import validate_operation
+            # Frozen JSON mappings/tuples become plain Product JSON before validation.
+            from roboagent.message import thaw_json
+            payload = thaw_json(arguments)
+            payload.pop("robot_id", None)
+            payload = validate_operation(payload, service.settings.robot_operation_timeout)
+            operation = await service.operations.start(robot_id, payload)
+            record = await service.operations.wait(robot_id, operation["operation_id"], getattr(context, "cancellation", None))
+            return ToolJsonContent(record)
+        except ProductError as exc:
+            # A confirmed backend failure must reach the Agent.  Reducing it to
+            # a generic runtime error encourages unsafe trial-and-error.
+            raise ToolExecutionFailure(ToolErrorInfo(exc.code, exc.message)) from exc
 
     async def stop(arguments: FrozenJsonObject, context: Any):
         robot_id = await _resolve_robot(service, arguments)
@@ -241,6 +259,15 @@ def _real_tools(service: RobotService, state_definition: ToolDefinition, state_h
         robot_id = await _resolve_robot(service, arguments)
         return ToolJsonContent(await service._guard(getattr(service.backend, "get_observations")(robot_id)))
 
+    async def preflight(arguments: FrozenJsonObject, context: Any):
+        robot_id = await _resolve_robot(service, arguments)
+        from .operations import validate_operation
+        from roboagent.message import thaw_json
+        payload = thaw_json(arguments)
+        payload.pop("robot_id", None)
+        payload = validate_operation(payload, service.settings.robot_operation_timeout)
+        return ToolJsonContent(await service._guard(service.backend.preflight_pick(robot_id, payload)))
+
     schema = FrozenJsonObject({"type": "object", "properties": properties,
                                "required": ["kind"], "additionalProperties": False})
     def task_timeout(arguments: FrozenJsonObject) -> float:
@@ -255,7 +282,10 @@ def _real_tools(service: RobotService, state_definition: ToolDefinition, state_h
         Tool(ToolDefinition("get_robot_observations", "Read fresh observed object IDs/poses, tool poses and Robot SDK readiness/recovery diagnostics. Current MuJoCo observations are simulation ground truth.",
                             FrozenJsonObject({"type": "object", "properties": {"robot_id": {"type": "string"}}, "additionalProperties": False})),
              observations, execution_mode=ToolExecutionMode.CONCURRENT, effect_kind=ToolEffectKind.READ_ONLY),
-        Tool(ToolDefinition("execute_robot_task", "Execute navigate, pick, place, sequence, gripper_move, gripper_grasp or recover. scene_joint drives a bounded simulation fixture actuator: object_id names its joint and position is its target; it does not perform a robot arm handle grasp. Pick/Place require observed objects and verified physical results. Navigation while holding an object is unsupported.", schema),
+        Tool(ToolDefinition("plan_robot_task", "Perform a no-motion collision-aware feasibility check before a pick. It chooses a feasible arm for manipulator=auto and must be called with fresh observations before requesting pick approval.",
+                            FrozenJsonObject({"type": "object", "properties": {"robot_id": {"type": "string"}, "kind": {"const": "pick"}, "object_id": {"type": "string"}, "manipulator": {"enum": ["auto", "left", "right"]}, "timeout_s": {"type": "number"}}, "required": ["kind", "object_id"], "additionalProperties": False})),
+             preflight, execution_mode=ToolExecutionMode.SERIAL, effect_kind=ToolEffectKind.READ_ONLY),
+        Tool(ToolDefinition("execute_robot_task", "Execute navigate, spin, pick, place, sequence, gripper_move, gripper_grasp or recover. spin rotates in place by required angle_rad (positive counter-clockwise) and succeeds only after odometry confirms that angle; use it for environmental observation. scene_joint drives a bounded simulation fixture actuator: object_id names its joint and position is its target; it does not perform a robot arm handle grasp. Pick/Place require observed objects and verified physical results. Navigation while holding an object is unsupported.", schema),
              execute, execution_mode=ToolExecutionMode.SERIAL, effect_kind=ToolEffectKind.SIDE_EFFECTING,
              timeout_resolver=task_timeout),
         Tool(ToolDefinition("stop_robot", "Cancel owned robot operations and stop the base; uncertain termination requires recovery.",

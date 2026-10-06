@@ -39,6 +39,8 @@ class DclpyRobotBackend:
         self._closing = False
         self._odom: Any = None
         self._odom_seen = 0.0
+        self._base_pose: Any = None
+        self._base_pose_seen = 0.0
         self._last_seen: float | None = None
         self._joints: dict[str, tuple[dict[str, Any], float]] = {}
         self._faults: dict[str, tuple[dict[str, Any], float]] = {}
@@ -63,6 +65,7 @@ class DclpyRobotBackend:
         self._lease_remote = False
         self._velocity: Any = None
         self._lease_client: Any = None
+        self._plan_client: Any = None
         self._task_client: Any = None
         self._grippers: dict[tuple[str, str], Any] = {}
         self._unconfirmed_gripper: tuple[str, dict[str, Any]] | None = None
@@ -84,12 +87,12 @@ class DclpyRobotBackend:
             from geometry_msgs_dclpy.msg import PoseStamped, Twist
             from mfr3duo_msgs_dclpy.action import ExecuteTask, Grasp, Move
             from mfr3duo_msgs_dclpy.msg import RobotStatus, TaskStep
-            from mfr3duo_msgs_dclpy.srv import ControlLease
+            from mfr3duo_msgs_dclpy.srv import ControlLease, PlanTask
             from nav_msgs_dclpy.msg import Odometry
             from sensor_msgs_dclpy.msg import BatteryState, Image, JointState
 
             self._types.update(Image=Image, Twist=Twist, PoseStamped=PoseStamped, ExecuteTask=ExecuteTask, TaskStep=TaskStep,
-                               ControlLease=ControlLease, Move=Move, Grasp=Grasp)
+                               ControlLease=ControlLease, PlanTask=PlanTask, Move=Move, Grasp=Grasp)
             self.context = Context(domain_id=self.settings.robot_domain_id,
                                    participant_name="roserver")
             self.node = Node("roserver", context=self.context,
@@ -97,6 +100,11 @@ class DclpyRobotBackend:
             self.executor = AsyncIOExecutor(self.context)
             self._velocity = self.node.create_publisher(Twist, self._name("tmr_controller/cmd_vel"), 1)
             self.node.create_subscription(Odometry, self._name("tmr_controller/odom"), self._on_odom, 10)
+            # This is opt-in. Simulation can provide ground truth, while a
+            # physical robot supplies a localization PoseStamped bridge.
+            if self.settings.robot_world_pose_topic:
+                self.node.create_subscription(PoseStamped, self.settings.robot_world_pose_topic,
+                                              self._on_base_pose, 10)
             self.node.create_subscription(JointState, self._name("joint_states"), self._on_joints, 10)
             self.node.create_subscription(JointState, self._name("simulation/scene/joint_states"),
                 self._on_scene_joints, 10)
@@ -109,6 +117,7 @@ class DclpyRobotBackend:
             # Image readers are acquired by media sessions/snapshots. Their DDS
             # matches enable only the requested camera at the ROS adapter.
             self._lease_client = self.node.create_client(ControlLease, self._name("robot/control"))
+            self._plan_client = self.node.create_client(PlanTask, self._name("robot/plan_task"))
             self._task_client = ActionClient(self.node, ExecuteTask, self._name("robot/execute_task"))
             for side in ("left", "right"):
                 for kind, action in (("move", Move), ("grasp", Grasp)):
@@ -127,6 +136,19 @@ class DclpyRobotBackend:
         self._odom = message
         self._odom_seen = time.monotonic()
         self._last_seen = time.time()
+
+    def _on_base_pose(self, message: Any) -> None:
+        self._base_pose = message
+        self._base_pose_seen = time.monotonic()
+        self._last_seen = time.time()
+
+    @staticmethod
+    def _pose_value(message: Any) -> dict[str, Any]:
+        p, q = message.pose.position, message.pose.orientation
+        return {"frame_id": message.header.frame_id, "x": p.x, "y": p.y, "z": p.z,
+                "theta": math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                    1 - 2 * (q.y * q.y + q.z * q.z)),
+                "orientation": {"x": q.x, "y": q.y, "z": q.z, "w": q.w}}
 
     def _on_joints(self, message: Any) -> None:
         seen = time.monotonic()
@@ -202,7 +224,12 @@ class DclpyRobotBackend:
         if self._fresh(self._status_seen):
             sdk = {"ready": self._status.ready, "busy": self._status.busy,
                    "state": int(self._status.state), "mode": self._status.mode, "diagnostic": self._status.diagnostic}
-        return {"robot_id": robot_id, "source": "simulation_ground_truth", "observations": observations,
+        base_pose = self._pose_value(self._base_pose) if self._fresh(self._base_pose_seen) else None
+        return {"robot_id": robot_id, "source": "robot_observations", "observations": observations,
+                "frames": {"navigation": "map", "base": base_pose["frame_id"] if base_pose else None,
+                           "object_pose_frames": sorted({item["pose"]["frame_id"] for item in observations
+                                                         if "pose" in item})},
+                "base_pose": base_pose,
                 "task_server": sdk, "recovery_required": self._uncertain or (sdk is not None and sdk["state"] == 3)}
 
     def _fresh(self, seen: float) -> bool:
@@ -272,7 +299,9 @@ class DclpyRobotBackend:
                 "connection": "online" if fresh else "offline",
                 "mode": "fault" if fault else "agent" if self._operation_active else "teleoperation" if self._authority else "idle",
                 "battery": self._battery if self._fresh(self._battery_seen) else None,
-                "pose": pose, "velocity": velocity,
+                "pose": pose,
+                "world_pose": self._pose_value(self._base_pose) if self._fresh(self._base_pose_seen) else None,
+                "navigation_frame": "map", "velocity": velocity,
                 "joints": [value for value, seen in self._joints.values() if self._fresh(seen)], "faults": faults}
 
     async def watch_robot_state(self, robot_id: str, *, interval_s: float = 0.05) -> AsyncIterator[dict[str, Any]]:
@@ -290,6 +319,24 @@ class DclpyRobotBackend:
             error = RobotBackendError(response.message or "Robot rejected control command.")
             error.code = response.error_code or "robot_not_ready"
             raise error
+
+    async def preflight_pick(self, robot_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._require(robot_id)
+        if arguments.get("kind") != "pick":
+            raise RobotExecutionError("Preflight currently requires a pick operation.")
+        if self._plan_client is None or not self._plan_client.service_is_ready():
+            raise RobotNotReadyError("Robot planning service is unavailable.")
+        request = self._types["PlanTask"].Request()
+        request.step = self._step(arguments)
+        response = await self._await_io(
+            self._plan_client.call_async(request), self.settings.robot_operation_timeout)
+        result = {"robot_id": robot_id, "kind": "pick", "feasible": bool(response.feasible),
+                  "manipulator": {0: "auto", 1: "left", 2: "right"}.get(
+                      int(response.selected_manipulator), "auto"),
+                  "message": str(response.message)}
+        if not response.feasible:
+            result["error_code"] = str(response.error_code or "robot_execution_failed")
+        return result
 
     async def acquire_control(self, robot_id: str, authority_id: str, mode: str, *, ttl_s: float,
                               timeout_ms: int = DEFAULT_TIMEOUT_MS) -> dict[str, Any]:
@@ -481,7 +528,7 @@ class DclpyRobotBackend:
         pose = arguments.get("pose")
         if pose is not None:
             step.has_pose = True
-            step.pose.header.frame_id = pose.get("frame_id", "map" if step.kind == "navigate" else "simulation_world")
+            step.pose.header.frame_id = pose.get("frame_id", "map")
             step.pose.pose.position.x, step.pose.pose.position.y = pose["x"], pose["y"]
             step.pose.pose.position.z = pose.get("z", 0.0)
             theta = pose.get("theta", 0.0)
@@ -509,6 +556,8 @@ class DclpyRobotBackend:
             if self._lease_client.service_is_ready():
                 lease = True  # Also clean up a submitted acquire with lost ACK.
                 await self._lease("acquire", authority, "task", min(3600, timeout + self.settings.robot_terminal_timeout + 5))
+            if kind == "spin":
+                return await self._spin(robot_id, float(arguments["angle_rad"]), timeout, feedback)
             if task_kind:
                 goal = self._types["ExecuteTask"].Goal(
                     authority_id=authority, timeout_s=timeout,
@@ -574,6 +623,40 @@ class DclpyRobotBackend:
                 self._active_runner = None
                 self._operation_active = False
 
+    async def _spin(self, robot_id: str, angle: float, timeout: float,
+                    feedback: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        """Rotate with the task lease held; confirm measured odometry, never elapsed time."""
+        if not self._fresh(self._odom_seen):
+            raise RobotNotReadyError("Fresh odometry is required for spin.")
+        initial = self._odom.pose.pose.orientation
+        previous = math.atan2(2 * (initial.w * initial.z + initial.x * initial.y),
+                              1 - 2 * (initial.y * initial.y + initial.z * initial.z))
+        traveled = 0.0
+        direction = 1.0 if angle > 0 else -1.0
+        velocity = direction * min(.3, self.settings.robot_max_angular_velocity)
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                if not self._fresh(self._odom_seen):
+                    raise RobotNotReadyError("Odometry became stale during spin.")
+                orientation = self._odom.pose.pose.orientation
+                current = math.atan2(2 * (orientation.w * orientation.z + orientation.x * orientation.y),
+                                     1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z))
+                delta = math.atan2(math.sin(current - previous), math.cos(current - previous))
+                traveled += delta
+                previous = current
+                feedback({"phase": "spin", "angle_rad": traveled, "target_angle_rad": angle})
+                if direction * traveled >= abs(angle):
+                    return {"robot_id": robot_id, "kind": "spin", "success": True,
+                            "termination_confirmed": True, "angle_rad": traveled}
+                message = self._types["Twist"]()
+                message.angular.z = velocity
+                await self._await_io(self._velocity.publish_async(message), .5)
+                await asyncio.sleep(.1)
+            raise RobotTimeoutError("Spin did not reach the requested angle before its deadline.")
+        finally:
+            await self._await_io(self._velocity.publish_async(self._types["Twist"]()), .5)
+
     async def _cancel_action(self) -> None:
         try:
             if self._active_handle is None and self._goal_future is not None:
@@ -602,6 +685,9 @@ class DclpyRobotBackend:
         from dclpy.action import ClientGoalHandle
         kind = arguments["kind"]
         if kind == "recover":
+            self._uncertain = True
+            return
+        if kind == "spin":
             self._uncertain = True
             return
         if kind.startswith("gripper_"):
